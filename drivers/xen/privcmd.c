@@ -44,6 +44,9 @@ MODULE_LICENSE("GPL");
 
 #define PRIV_VMA_LOCKED ((void *)1)
 
+#define GUEST_SIZE (512 * 1024 * 1024)
+#define GUEST_PAGES (GUEST_SIZE >> PAGE_SHIFT)
+
 static unsigned int privcmd_dm_op_max_num = 16;
 module_param_named(dm_op_max_nr_bufs, privcmd_dm_op_max_num, uint, 0644);
 MODULE_PARM_DESC(dm_op_max_nr_bufs,
@@ -59,6 +62,8 @@ struct privcmd_data {
 	domid_t domid;
 };
 
+static domid_t domid_hacked;
+static bool skip;
 static int privcmd_vma_range_is_mapped(
                struct vm_area_struct *vma,
                unsigned long addr,
@@ -105,7 +110,7 @@ static void free_page_list(struct list_head *pages)
  */
 static int gather_array(struct list_head *pagelist,
 			unsigned nelem, size_t size,
-			const void __user *data)
+			const void __user *data, bool via_mmap)
 {
 	unsigned pageidx;
 	void *pagedata;
@@ -131,8 +136,12 @@ static int gather_array(struct list_head *pagelist,
 		}
 
 		ret = -EFAULT;
-		if (copy_from_user(pagedata + pageidx, data, size))
-			goto fail;
+		if (via_mmap) {
+			memcpy(pagedata + pageidx, data, size);
+		} else {
+			if (copy_from_user(pagedata + pageidx, data, size))
+				goto fail;
+		}
 
 		data += size;
 		pageidx += size;
@@ -270,7 +279,7 @@ static long privcmd_ioctl_mmap(struct file *file, void __user *udata)
 
 	rc = gather_array(&pagelist,
 			  mmapcmd.num, sizeof(struct privcmd_mmap_entry),
-			  mmapcmd.entry);
+			  mmapcmd.entry, false);
 
 	if (rc || list_empty(&pagelist))
 		goto out;
@@ -439,37 +448,17 @@ static int alloc_empty_pages(struct vm_area_struct *vma, int numpgs)
 
 static const struct vm_operations_struct privcmd_vm_ops;
 
-static long privcmd_ioctl_mmap_batch(
-	struct file *file, void __user *udata, int version)
+static long _privcmd_ioctl_mmap_batch(
+	struct file *file, struct privcmd_mmapbatch_v2 m, int version,
+	struct vm_area_struct *vma)
 {
 	struct privcmd_data *data = file->private_data;
 	int ret;
-	struct privcmd_mmapbatch_v2 m;
 	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma;
 	unsigned long nr_pages;
 	LIST_HEAD(pagelist);
 	struct mmap_batch_state state;
-
-	switch (version) {
-	case 1:
-		if (copy_from_user(&m, udata, sizeof(struct privcmd_mmapbatch)))
-			return -EFAULT;
-		/* Returns per-frame error in m.arr. */
-		m.err = NULL;
-		if (!access_ok(m.arr, m.num * sizeof(*m.arr)))
-			return -EFAULT;
-		break;
-	case 2:
-		if (copy_from_user(&m, udata, sizeof(struct privcmd_mmapbatch_v2)))
-			return -EFAULT;
-		/* Returns per-frame error code in m.err. */
-		if (!access_ok(m.err, m.num * (sizeof(*m.err))))
-			return -EFAULT;
-		break;
-	default:
-		return -EINVAL;
-	}
+	bool via_mmap = !!vma;
 
 	/* If restriction is in place, check the domid matches */
 	if (data->domid != DOMID_INVALID && data->domid != m.dom)
@@ -479,10 +468,11 @@ static long privcmd_ioctl_mmap_batch(
 	if ((m.num <= 0) || (nr_pages > (LONG_MAX >> PAGE_SHIFT)))
 		return -EINVAL;
 
-	ret = gather_array(&pagelist, m.num, sizeof(xen_pfn_t), m.arr);
+	ret = gather_array(&pagelist, m.num, sizeof(xen_pfn_t), m.arr, via_mmap);
 
 	if (ret)
 		goto out;
+
 	if (list_empty(&pagelist)) {
 		ret = -EINVAL;
 		goto out;
@@ -496,13 +486,15 @@ static long privcmd_ioctl_mmap_batch(
 		}
 	}
 
-	mmap_write_lock(mm);
+	if (!via_mmap)
+		mmap_write_lock(mm);
 
-	vma = find_vma(mm, m.addr);
-	if (!vma ||
-	    vma->vm_ops != &privcmd_vm_ops) {
-		ret = -EINVAL;
-		goto out_unlock;
+	if (!vma) {
+		vma = find_vma(mm, m.addr);
+		if (!vma || vma->vm_ops != &privcmd_vm_ops) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
 	}
 
 	/*
@@ -552,7 +544,8 @@ static long privcmd_ioctl_mmap_batch(
 	BUG_ON(traverse_pages_block(m.num, sizeof(xen_pfn_t),
 				    &pagelist, mmap_batch_fn, &state));
 
-	mmap_write_unlock(mm);
+	if (!via_mmap)
+		mmap_write_unlock(mm);
 
 	if (state.global_error) {
 		/* Write back errors in second pass. */
@@ -575,6 +568,42 @@ out:
 out_unlock:
 	mmap_write_unlock(mm);
 	goto out;
+}
+
+static long privcmd_ioctl_mmap_batch(
+	struct file *file, void __user *udata, int version)
+{
+	struct privcmd_mmapbatch_v2 m;
+
+	switch (version) {
+	case 1:
+		if (copy_from_user(&m, udata, sizeof(struct privcmd_mmapbatch)))
+			return -EFAULT;
+		/* Returns per-frame error in m.arr. */
+		m.err = NULL;
+		if (!access_ok(m.arr, m.num * sizeof(*m.arr)))
+			return -EFAULT;
+		break;
+	case 2:
+		if (copy_from_user(&m, udata, sizeof(struct privcmd_mmapbatch_v2)))
+			return -EFAULT;
+		/* Returns per-frame error code in m.err. */
+		if (!access_ok(m.err, m.num * (sizeof(*m.err))))
+			return -EFAULT;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (m.dom)
+		domid_hacked = m.dom;
+
+	if (m.num == GUEST_PAGES && skip) {
+		skip = false;
+		return 0;
+	}
+
+	return _privcmd_ioctl_mmap_batch(file, m, version, NULL);
 }
 
 static int lock_pages(
@@ -939,6 +968,26 @@ static int privcmd_mmap(struct file *file, struct vm_area_struct *vma)
 	vma->vm_ops = &privcmd_vm_ops;
 	vma->vm_private_data = NULL;
 
+	if (vma->vm_end - vma->vm_start == GUEST_SIZE) {
+		int i, ret;
+		xen_pfn_t __user *arr = kcalloc(GUEST_PAGES, sizeof(*arr), GFP_KERNEL);
+		unsigned int phy_addr = 0x40000000 >> PAGE_SHIFT;
+
+		struct privcmd_mmapbatch_v2 m = {
+			.num = GUEST_PAGES,
+			.dom = domid_hacked,
+			.addr = vma->vm_start,
+			.arr = arr,
+		};
+
+		for (i = 0; i < GUEST_PAGES; i++)
+			arr[i] = phy_addr + i;
+
+		ret = _privcmd_ioctl_mmap_batch(file, m, 1, vma);
+		WARN_ON(ret);
+		kfree(arr);
+		skip = true;
+	}
 	return 0;
 }
 
