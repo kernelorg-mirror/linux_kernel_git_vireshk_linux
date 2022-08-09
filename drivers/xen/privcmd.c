@@ -1010,12 +1010,21 @@ static int privcmd_vma_range_is_mapped(
 				   is_mapped_fn, NULL) != 0;
 }
 
+static loff_t privcmd_llseek(struct file *file, loff_t offset, int whence)
+{
+	if (whence == SEEK_END)
+		return GUEST_SIZE;
+
+	return 0;
+}
+
 const struct file_operations xen_privcmd_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = privcmd_ioctl,
 	.open = privcmd_open,
 	.release = privcmd_release,
 	.mmap = privcmd_mmap,
+	.llseek = privcmd_llseek,
 };
 EXPORT_SYMBOL_GPL(xen_privcmd_fops);
 
